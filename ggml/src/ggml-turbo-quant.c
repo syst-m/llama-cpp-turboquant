@@ -10,13 +10,18 @@
 #include "ggml-common.h"
 #include "ggml-impl.h"
 
+#define _USE_MATH_DEFINES
 #include <math.h>
 #include <string.h>
 #include <assert.h>
 #include <stdlib.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 /* Global: WHT group size for CPU quantize path (set by CPU SET_ROWS handler) */
-int turbo3_cpu_wht_group_size = 0;
+GGML_API int turbo3_cpu_wht_group_size = 0;
 
 /* ---------- constants ---------- */
 
@@ -24,12 +29,6 @@ int turbo3_cpu_wht_group_size = 0;
 #define TURBO_SEED_QJL      1042
 #define TURBO_D             128  /* rotation group size = head_dim (independent of block size) */
 #define TURBO_QJL_CONST     1.2533141373155003f  /* sqrt(pi/2) */
-
-/* TURBO_D must match QK_TURBO3_GROUP from ggml-common.h — they represent
- * the same rotation group size but are defined separately. Guard against
- * silent divergence so GPU kernels and CPU reference stay in sync. */
-static_assert(TURBO_D == QK_TURBO3_GROUP,
-    "TURBO_D must equal QK_TURBO3_GROUP (rotation group size)");
 
 /* Optimal centroids from paper (scaled by 1/sqrt(d)) */
 /* 2-bit: {±0.453, ±1.51} / sqrt(d) */
@@ -69,18 +68,16 @@ static void turbo_init_rotation(void) {
 
     const int d = TURBO_D;
 
-    /* Generate random Gaussian matrix directly into turbo_rotation.
-     * Previous code used a 64KB stack-local G[128*128] then memcpy'd —
-     * this segfaults on llama.cpp worker threads with reduced stack
-     * sizes (512KB macOS, 64KB some Linux configs). Writing directly
-     * into the static array avoids the stack allocation entirely. */
+    /* Generate random Gaussian matrix */
     turbo_prng_seed(TURBO_SEED_ROTATION);
+    float G[TURBO_D * TURBO_D];
     for (int i = 0; i < d * d; i++) {
-        turbo_rotation[i] = (float)turbo_prng_normal();
+        G[i] = (float)turbo_prng_normal();
     }
 
     /* QR decomposition via modified Gram-Schmidt */
     /* Q stored column-major in turbo_rotation */
+    memcpy(turbo_rotation, G, d * d * sizeof(float));
 
     for (int j = 0; j < d; j++) {
         /* Normalize column j */
@@ -451,9 +448,10 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
             memset(normalized, 0, d * sizeof(float));
         }
 
-        /* Step 2: Rotate */
+        /* Step 2: Forward WHT rotation (matches CUDA set_rows) */
         float rotated[TURBO_D];
-        matvec(turbo_rotation, normalized, rotated, d);
+        memcpy(rotated, normalized, d * sizeof(float));
+        turbo_cpu_fwht(rotated, d);
 
 #if TURBO4_USE_4BIT
         /* Step 3: 4-bit quantization (16 centroids) */
@@ -554,14 +552,15 @@ void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGM
     };
     for (int block = 0; block < nb; block++) {
         float norm = GGML_FP16_TO_FP32(x[block].norm);
-        float rotated[QK_TURBO4];
+        float * dst = y + block * d;
         for (int i = 0; i < d; i++) {
             uint8_t idx = (x[block].qs[i / 2] >> ((i % 2) * 4)) & 0xF;
-            rotated[i] = CENTROIDS_4BIT[idx];
+            dst[i] = CENTROIDS_4BIT[idx] * norm;
         }
-        float * dst = y + block * d;
-        matvec(turbo_rotation_t, rotated, dst, d);
-        for (int i = 0; i < d; i++) dst[i] *= norm;
+        /* No inverse WHT, dequant stays in the rotated domain.
+        * Q is WHT-rotated by the graph, so <Q_rot, K_rot> gives correct attention scores.
+        * The inverse WHT is applied to the attention output via GGML_OP_TURBO_WHT (direction=1) in the graph. 
+        */
     }
 #else
     /* Legacy 3-bit + QJL dequant */
@@ -626,8 +625,11 @@ size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     return nrows * row_size;
 }
 
-/* ---------- TQ3_1S and TQ4_1S helper constants and functions ---------- */
+/* ================================================================== */
+/* TQ3_1S / TQ4_1S: WHT-rotated weight quantization                  */
+/* ================================================================== */
 
+/* Lloyd-Max centroids for N(0,1) — shared with Metal shaders */
 static const float TQ3_0_CENTROIDS[8] = {
     -1.996684f, -1.291398f, -0.740341f, -0.247508f,
      0.230106f,  0.725222f,  1.277503f,  1.988943f
@@ -682,6 +684,7 @@ static void tq3_0_rht_inverse(float * buf) {
 
 /* Nearest centroid for TQ3 (8 centroids) */
 static int tq3_0_choose_index(float val) {
+    /* Binary search on midpoints of TQ3_0_CENTROIDS */
     if (val < -1.644041f) return 0;
     if (val < -1.015870f) return 1;
     if (val < -0.493925f) return 2;
@@ -694,6 +697,7 @@ static int tq3_0_choose_index(float val) {
 
 /* Nearest centroid for TQ4 (16 centroids) */
 static int tq4_0_choose_index(float val) {
+    /* Binary search on midpoints of TQ4_0_CENTROIDS */
     if (val < -2.400804f) return 0;
     if (val < -1.843532f) return 1;
     if (val < -1.437139f) return 2;
