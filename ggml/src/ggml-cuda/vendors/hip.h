@@ -10,6 +10,11 @@
 #include <rocwmma/rocwmma-version.hpp>
 #endif // defined(GGML_HIP_ROCWMMA_FATTN)
 
+#ifdef GGML_USE_NCCL
+#include <rccl/rccl.h>
+#endif // GGML_USE_NCCL
+
+
 #define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
 #define CUBLAS_GEMM_DEFAULT_TENSOR_OP HIPBLAS_GEMM_DEFAULT
 #define CUBLAS_OP_N HIPBLAS_OP_N
@@ -28,6 +33,7 @@
 #define CU_MEM_LOCATION_TYPE_DEVICE hipMemLocationTypeDevice
 #define CU_MEM_ACCESS_FLAGS_PROT_READWRITE hipMemAccessFlagsProtReadWrite
 #define CU_CHECK(fn) {hipError_t err = fn; if(err != hipSuccess) { GGML_ABORT("HipVMM Failure: %s\n", hipGetErrorString(err)); }}
+#define NCCL_CHECK(fn) {ncclResult_t err = fn; if(err != ncclSuccess) { GGML_ABORT("RCCL Failure RCCL returned: %i\n", err); }}
 // __shfl_sync: support both 3-arg (mask, var, srcLane) and 4-arg (mask, var, srcLane, width) calls
 // HIP ignores the mask but requires it to be 64-bit, so we cast explicitly.
 #define __SHFL_SYNC_3(mask, var, srcLane)        __shfl(var, srcLane, warpSize)
@@ -39,13 +45,11 @@
 #define __SHFL_UP_SYNC_4(mask, var, delta, width) __shfl_up(var, delta, width)
 #define __SHFL_UP_GET(_1, _2, _3, _4, NAME, ...) NAME
 #define __shfl_up_sync(...) __SHFL_UP_GET(__VA_ARGS__, __SHFL_UP_SYNC_4, __SHFL_UP_SYNC_3)(__VA_ARGS__)
-
 // __shfl_xor_sync: support 3-arg and 4-arg calls (HIP ignores mask)
 #define __SHFL_XOR_SYNC_3(mask, var, laneMask)        __shfl_xor(var, laneMask, warpSize)
 #define __SHFL_XOR_SYNC_4(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
 #define __SHFL_XOR_GET(_1, _2, _3, _4, NAME, ...) NAME
 #define __shfl_xor_sync(...) __SHFL_XOR_GET(__VA_ARGS__, __SHFL_XOR_SYNC_4, __SHFL_XOR_SYNC_3)(__VA_ARGS__)
-
 // __shfl_down_sync: support 3-arg and 4-arg calls (HIP ignores mask)
 #define __SHFL_DOWN_SYNC_3(mask, var, delta)        __shfl_down(var, delta, warpSize)
 #define __SHFL_DOWN_SYNC_4(mask, var, delta, width) __shfl_down(var, delta, width)
@@ -150,6 +154,9 @@
 #define cudaGraphNodeTypeKernel hipGraphNodeTypeKernel
 #define cudaGraphInstantiate hipGraphInstantiate
 #define cudaStreamEndCapture hipStreamEndCapture
+#define cudaStreamCaptureStatus hipStreamCaptureStatus
+#define cudaStreamIsCapturing hipStreamIsCapturing
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
 #define cudaGraphDestroy hipGraphDestroy
 #define cudaGraphKernelNodeSetParams hipGraphKernelNodeSetParams
 #define cudaErrorInvalidDeviceFunction hipErrorInvalidDeviceFunction
@@ -208,6 +215,10 @@
 #define GCN
 #endif // defined(GCN5) || defined(GCN4)
 
+#if defined(__gfx950__)
+#define CDNA4
+#endif // defined(__gfx950__)
+
 #if defined(__gfx942__)
 #define CDNA3
 #endif // defined(__gfx942__)
@@ -220,9 +231,9 @@
 #define CDNA1
 #endif // defined(__gfx908__)
 
-#if defined(CDNA3) || defined(CDNA2) || defined(CDNA1)
+#if defined(CDNA4) || defined(CDNA3) || defined(CDNA2) || defined(CDNA1)
 #define CDNA // For the entire family
-#endif // defined(CDNA3) || defined(CDNA2) || defined(CDNA1)
+#endif // defined(CDNA4) || defined(CDNA3) || defined(CDNA2) || defined(CDNA1)
 
 #if defined(__GFX12__)
 #define RDNA4
